@@ -18,7 +18,7 @@ use windows::Win32::{
 use crate::{
 	ChildExitStatus,
 	windows::{
-		JobPort, job_creation_flags, make_job_object, resume_threads, terminate_job, wait_on_job,
+		JobObjectHandle, JobPort, job_creation_flags, make_job_object, resume_threads, wait_on_job,
 	},
 };
 
@@ -28,7 +28,7 @@ use super::CreationFlags;
 use super::KillOnDrop;
 use super::{ChildWrapper, CommandWrap, CommandWrapper};
 
-/// Wrapper which creates a job object context for a `Command`.
+/// Wrapper which creates a job object context for a [`Command`].
 ///
 /// This wrapper is only available on Windows.
 ///
@@ -36,10 +36,19 @@ use super::{ChildWrapper, CommandWrap, CommandWrapper};
 /// to process groups on Unix or even cgroups on Linux, with the ability to restrict resource use.
 /// See [Job Objects](https://docs.microsoft.com/en-us/windows/win32/procthread/job-objects).
 ///
+/// [`CreationFlags`] may be registered before or after [`JobObject`]; process-wrap preserves its flags
+/// and distinguishes explicit suspension from the temporary suspension needed for assignment.
+///
 /// This wrapper provides a child wrapper: [`JobObjectChild`].
 ///
-/// [`CreationFlags`] may be registered before or after `JobObject`; process-wrap preserves its flags
-/// and distinguishes explicit suspension from the temporary suspension needed for assignment.
+/// # Example
+///
+/// ```rust
+/// use process_wrap::tokio::{CommandWrap, JobObject};
+///
+/// let mut command = CommandWrap::with_new("ls", |command| { command.arg("-l"); });
+/// command.wrap(JobObject);
+/// ```
 #[derive(Clone, Copy, Debug)]
 pub struct JobObject;
 
@@ -47,7 +56,9 @@ fn user_creation_flags(core: &CommandWrap) -> PROCESS_CREATION_FLAGS {
 	#[cfg(feature = "creation-flags")]
 	{
 		core.get_wrap::<CreationFlags>()
-			.map_or(PROCESS_CREATION_FLAGS(0), |flags| flags.0)
+			.map_or(PROCESS_CREATION_FLAGS(0), |flags| {
+				PROCESS_CREATION_FLAGS(flags.0)
+			})
 	}
 	#[cfg(not(feature = "creation-flags"))]
 	{
@@ -119,7 +130,7 @@ impl CommandWrapper for JobObject {
 
 		if policy.resume_after_assignment {
 			if let Err(error) = resume_threads(handle) {
-				let _ = terminate_job(job_port.job, 1);
+				let _ = job_port.job.terminate(1);
 				terminate_child(&mut *inner);
 				return Err(error);
 			}
@@ -146,6 +157,15 @@ impl JobObjectChild {
 			job_port,
 		}
 	}
+
+	/// Get a handle to the job object this child was assigned to.
+	///
+	/// Unlike the child, the handle can be cloned and used from other threads, for example to
+	/// terminate the job while another thread waits on the child, and it keeps the job open after
+	/// the child is dropped. See [`JobObjectHandle`].
+	pub fn job_handle(&self) -> &JobObjectHandle {
+		&self.job_port.job
+	}
 }
 
 impl ChildWrapper for JobObjectChild {
@@ -170,7 +190,7 @@ impl ChildWrapper for JobObjectChild {
 
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]
 	fn start_kill(&mut self) -> Result<()> {
-		terminate_job(self.job_port.job, 1)
+		self.job_port.job.terminate(1)
 	}
 
 	#[cfg_attr(feature = "tracing", instrument(level = "debug", skip(self)))]

@@ -115,6 +115,22 @@ CommandWrap::with_new("watch", |command| { command.arg("ls"); })
 requested flag, temporarily adds `CREATE_SUSPENDED` while assigning the process, and resumes it
 after assignment unless the caller explicitly requested `CREATE_SUSPENDED`.
 
+To terminate the job without the child, for example from another thread while the child is being
+waited on, get a `JobObjectHandle` from the `JobObjectChild`. It can be cloned and sent across
+threads, and keeps the job open for as long as it's held, even after the child is dropped:
+
+```rust
+let mut child = CommandWrap::with_new("watch", |command| { command.arg("ls"); })
+  .wrap(JobObject)
+  .spawn()?;
+let job = (child.as_ref() as &dyn std::any::Any)
+  .downcast_ref::<JobObjectChild>()
+  .expect("JobObject is the outermost wrapper")
+  .job_handle();
+std::thread::spawn(move || job.terminate(1));
+let status = child.wait().await?;
+```
+
 ### Process group
 
 - Platforms: POSIX (Linux, Mac, BSDs...)
@@ -176,9 +192,9 @@ CommandWrap::with_new("watch", |command| { command.arg("ls"); })
 This is a shim to allow setting Windows process creation flags with this API, as otherwise they'd be overwritten.
 
 ```rust
-use windows::Win32::System::Threading::*;
-CommandWrap::with_new("watch", |command| { command.arg("ls"); })
-  .wrap(CreationFlags(CREATE_NO_WINDOW | CREATE_DETACHED))
+use windows::Win32::System::Threading::CREATE_NO_WINDOW;
+let child = CommandWrap::with_new("watch", |command| { command.arg("ls"); })
+  .wrap(CreationFlags(CREATE_NO_WINDOW.0))
   .wrap(JobObject)
   .spawn()?;
 ```
@@ -189,7 +205,7 @@ after assignment unless the caller explicitly requested `CREATE_SUSPENDED`.
 
 ### Kill on drop
 
-- Platforms: all (Tokio-only)
+- Platforms: all
 - Like command-group.
 - Feature: `kill-on-drop` (default)
 
@@ -201,6 +217,31 @@ let child = CommandWrap::with_new("watch", |command| { command.arg("ls"); })
   .wrap(ProcessGroup::leader())
   .spawn()?;
 drop(child);
+```
+
+### Propagate Thread Death
+
+- Platforms: Linux only
+- Feature: `propagate-thread-death`
+
+This sets [parent-death signal] on the child process.
+
+[parent-death signal]: https://www.man7.org/linux/man-pages/man2/PR_SET_PDEATHSIG.2const.html
+
+```rust
+use std::{io, thread, process::{Stdio, Command}};
+// PropagateThreadDeath ties the subprocess lifetime to the spawning thread.
+let handle = thread::spawn(|| {
+	let child = CommandWrap::from(Command::new("yes"))
+	.wrap(PropagateThreadDeath::default())
+	.spawn()?;
+	Ok::<_, io::Error>(child.id())
+});
+let dead_pid = handle
+	.join()
+	.expect("Thread panicked")
+	.expect("Thread failed to spawn");
+// The `yes` subprocess was killed by the kernel.
 ```
 
 ### Your own
@@ -265,3 +306,4 @@ Both can exist at the same time, but generally you should use one or the other.
 - `process-group`: **default**, enables the [process group](#process-group) wrapper.
 - `process-session`: **default**, enables the [process session](#process-session) wrapper.
 - `reset-sigmask`: enables the [reset signal mask](#reset-signal-mask) wrapper.
+- `propagate-thread-death`: enables the [propagate thread death](#propagate-thread-death) wrapper.
